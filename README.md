@@ -10,7 +10,8 @@
 - 🚫 不落日志、不留历史、不推 stdout/stderr 正文、不推命令原文
 - 🪶 单文件、零依赖(宿主侧复用 DSH 自带的 `ws`)
 
-配套的 Android 前端(dsh-aui 2.0.2)把它渲染到会话流里那条构建工具行的标题位置,收到 `build-done` 立即撤下。
+配套的 Android 前端(dsh-aui 2.0.3)把它渲染到会话流里那条构建工具行的标题位置,**原地刷新**;
+构建结束后不撤下,而是换成**收尾行**(`✅ BUILD SUCCESSFUL in 2m 23s` / `❌ BUILD FAILED in 1m 3s`)留在原处。
 
 ---
 
@@ -64,7 +65,7 @@ ws.on('error',e=>{console.log('✗',e.message);process.exit(1)});"
 | --- | --- | --- |
 | `hello` | `builds:[{callId,sessionId,text,percent,phase,elapsed}]` | 连上即发,只反映**此刻**在跑的构建(不是历史) |
 | `build-progress` | `callId,sessionId,text,percent,phase,elapsed` | 进度行变化时推;`text` 如 `<=====> 73% EXECUTING [1m 32s]` |
-| `build-done` | `callId,sessionId,exitCode` | 构建结束,前端撤下该行进度 |
+| `build-done` | `callId,sessionId,exitCode,ok,text,percent,elapsed` | 构建结束;`text` 是收尾行(优先取 Gradle 自己的 `BUILD SUCCESSFUL/FAILED in …`),前端把它留在该行 |
 
 `callId` 是官方 `tool/call` 事件的调用 id,前端靠它把进度画到**对应的那一行工具**上。
 
@@ -85,7 +86,7 @@ ws.on('error',e=>{console.log('✗',e.message);process.exit(1)});"
 
 1. 只对 Gradle 类构建生效(其它工具的花式 spinner 不推)。
 2. 后端基址必须是本机回环(`127.0.0.1`/`localhost`):通道只信任回环请求。
-3. 进度只在**构建进行中**显示,结束即撤下,不留任何痕迹。
+3. 进度只在**构建进行中**显示,结束后换成一行收尾结论留在原处(前端内存里,应用重启/会话重载即清),不落盘、不进会话日志。
 
 ## License
 
