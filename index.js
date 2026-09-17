@@ -362,6 +362,10 @@ class BuildProgress {
 /**
  * 取流末尾最后一行 Gradle 进度。
  * 先剥 ANSI(rich 控制台把 `<===>` 拆成好几段并夹带颜色/光标序列),再取**最后一次**匹配。
+ *
+ * ⚠️ 跳过 `WAITING` 阶段:构建收尾时 Gradle 会画 `<-------------> 0% WAITING`
+ * (等输入/等守护退出),它不是构建进度。实测(2026-09-18)它会把"最后一帧"冲成 0%,
+ * 于是界面上进度条会在结束时先跳回 0% 再变成收尾行 —— 看起来像倒退。
  * @returns {{text:string,percent:number,phase:string,elapsed:string}|null}
  */
 function lastProgress(raw) {
@@ -369,7 +373,10 @@ function lastProgress(raw) {
   PROGRESS.lastIndex = 0;
   let hit = null;
   let m;
-  while ((m = PROGRESS.exec(clean)) !== null) hit = m;
+  while ((m = PROGRESS.exec(clean)) !== null) {
+    if (m[2] === 'WAITING') continue;
+    hit = m;
+  }
   if (hit === null) return null;
   return {
     text: hit[0].replace(/\s+/g, ' ').trim(),
