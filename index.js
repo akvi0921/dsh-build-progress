@@ -55,6 +55,12 @@ export const inject = ['webServer', 'subprocess'];
 const BUILD_CMD = /\b(gradlew|gradle)\b/;
 /** Gradle 进度行:rich 控制台是 `<=====> 73% EXECUTING [1m 32s]`;plain 控制台没有进度行(那就什么都不推)。 */
 const PROGRESS = /<\s*[-=]+>\s*(\d{1,3})%\s*([A-Z]+)(?:\s*\[([^\]]+)\])?/g;
+/**
+ * Gradle 的收尾行:`BUILD SUCCESSFUL in 2m 23s` / `BUILD FAILED in 1m 2s`。
+ * 构建结束那一刻,这一行比任何自己拼的文案都准(时长是 Gradle 自己算的),
+ * 所以优先用它作为"常驻收尾行"的文本。
+ */
+const BUILD_RESULT = /BUILD (SUCCESSFUL|FAILED)(?: in ([^\n\r]*))?/g;
 /** 只看流末尾这么长的一段(进度行总在最新位置)。 */
 const TAIL_BYTES = 8192;
 /** 采集间隔(ms)。 */
@@ -203,49 +209,83 @@ class BuildProgress {
     };
   }
 
+  /** 读一次新增输出并追加到 tail;读完返回 false。poll 与 finish 共用。 */
+  drain(rec) {
+    try {
+      const read = rec.reader.readFrom(rec.offset);
+      if (read === undefined || read === null) return false;
+      rec.offset = read.nextOffset ?? rec.offset;
+      const text = typeof read.text === 'string' ? read.text : '';
+      if (text.length === 0) return false;
+      rec.tail = (rec.tail + text).slice(-TAIL_BYTES);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   poll() {
     if (this.builds.size === 0) return;
     for (const rec of this.builds.values()) {
       if (rec.done) continue;
-      try {
-        const read = rec.reader.readFrom(rec.offset);
-        if (read === undefined || read === null) continue;
-        rec.offset = read.nextOffset ?? rec.offset;
-        const text = typeof read.text === 'string' ? read.text : '';
-        if (text.length > 0) {
-          rec.tail = (rec.tail + text).slice(-TAIL_BYTES);
-          const line = lastProgress(rec.tail);
-          if (line !== null && line.text !== rec.text) {
-            rec.text = line.text;
-            rec.percent = line.percent;
-            rec.phase = line.phase;
-            rec.elapsed = line.elapsed;
-            this.broadcast({
-              type: 'build-progress',
-              callId: rec.callId,
-              sessionId: rec.sessionId,
-              text: line.text,
-              percent: line.percent,
-              phase: line.phase,
-              elapsed: line.elapsed,
-            });
-          }
-        }
-      } catch {
-        // 读取异常忽略(下个周期继续)
+      if (!this.drain(rec)) continue;
+      const line = lastProgress(rec.tail);
+      if (line !== null && line.text !== rec.text) {
+        rec.text = line.text;
+        rec.percent = line.percent;
+        rec.phase = line.phase;
+        rec.elapsed = line.elapsed;
+        this.broadcast({
+          type: 'build-progress',
+          callId: rec.callId,
+          sessionId: rec.sessionId,
+          text: line.text,
+          percent: line.percent,
+          phase: line.phase,
+          elapsed: line.elapsed,
+        });
       }
     }
   }
 
+  /**
+   * 构建结束。
+   *
+   * 用户明确要求(2026-09-18):"构建完成后进度条不要立刻消失,要持久一点"。
+   * 所以这里不再只发一个"撤下"信号,而是给出**收尾行**文本:
+   *   ① 优先 Gradle 自己的收尾行 `✅ BUILD SUCCESSFUL in 2m 23s`(时长由 Gradle 计算,最可信);
+   *   ② 拿不到(被中断/超时/输出被重定向)就用最后一帧进度 + 退出码拼一句;
+   *   ③ 既没有进度帧也没有收尾行(例如只是跑 `gradle --version`)→ text 为空,
+   *      前端按老行为撤下进度行,不在非构建场景里留一行莫名其妙的字。
+   * 前端收到后把这一行**留在折叠标题位置**直到应用重启/会话重载,不再随帧刷新。
+   */
   finish(rec, outcome) {
     if (rec.done) return;
     rec.done = true;
     this.builds.delete(rec.key);
+    // 结束前把最后一段输出读完:进度行和 Gradle 收尾行常常就在这最后一段里,
+    // 不读完会漏掉最有用的那一行(实测 poll 周期 150ms,结束信号可能先到)。
+    for (let i = 0; i < 4; i += 1) {
+      if (!this.drain(rec)) break;
+    }
+    const line = lastProgress(rec.tail);
+    if (line !== null) {
+      rec.text = line.text;
+      rec.percent = line.percent;
+      rec.phase = line.phase;
+      rec.elapsed = line.elapsed;
+    }
+    const exitCode = typeof outcome?.exitCode === 'number' ? outcome.exitCode : null;
+    const ok = exitCode === 0;
     this.broadcast({
       type: 'build-done',
       callId: rec.callId,
       sessionId: rec.sessionId,
-      exitCode: outcome?.exitCode ?? null,
+      exitCode,
+      ok,
+      text: finalLine(rec, exitCode),
+      percent: rec.percent,
+      elapsed: rec.elapsed,
     });
   }
 
@@ -337,6 +377,27 @@ function lastProgress(raw) {
     phase: hit[2],
     elapsed: hit[3] ?? '',
   };
+}
+
+/**
+ * 构建收尾行(留在前端折叠标题位置的那一行)。没有可说的内容时返回 ''。
+ * @returns {string}
+ */
+function finalLine(rec, exitCode) {
+  const clean = stripAnsi(rec.tail);
+  BUILD_RESULT.lastIndex = 0;
+  let hit = null;
+  let m;
+  while ((m = BUILD_RESULT.exec(clean)) !== null) hit = m; // 取最后一次(重跑/多模块时以最终结论为准)
+  if (hit !== null) {
+    const verdict = hit[1] === 'SUCCESSFUL';
+    const dur = String(hit[2] ?? '').replace(/\s+/g, ' ').trim();
+    return `${verdict ? '✅' : '❌'} BUILD ${hit[1]}${dur === '' ? '' : ` in ${dur}`}`;
+  }
+  if (rec.text === '') return ''; // 既没进度也没收尾行:交给前端按老行为撤下
+  if (exitCode === null) return `⚠️ 构建中断 · ${rec.text}`;
+  if (exitCode === 0) return `✅ 构建完成 · ${rec.text}`;
+  return `❌ 构建失败 (exit ${exitCode}) · ${rec.text}`;
 }
 
 /** 剔除 ANSI 转义(CSI/OSC;含光标移动与擦除行,只留可见文本)。 */
